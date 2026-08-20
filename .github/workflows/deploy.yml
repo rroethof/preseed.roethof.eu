@@ -1,0 +1,129 @@
+# Deploy workflow voor mijn Laravel/Inertia/Vue preseed-generator.
+#
+# Ik laat hier bewust NIETS bouwen op de GitHub Actions-runner: ik rsync de
+# repo gewoon naar de server, en composer/npm/artisan draaien daarna allemaal
+# op de server zelf via SSH. Dat is voor mij logischer dan de runner alles
+# te laten doen — ik heb toch al shell-toegang, en ik wil dat de server-
+# omgeving (PHP-extensies etc.) leidend is, niet die van de runner.
+#
+# Ik log via SSH in als mezelf (de deploy-user), niet als root, en die user
+# is al eigenaar van de bestanden op de server — dus chown/chmod na de
+# rsync heb ik niet nodig.
+
+name: 🚀 Deploy Laravel
+
+# Ik geef deze workflow alleen leesrechten op de repo (checkout); hij hoeft
+# nergens naar terug te schrijven (geen commits, geen PR's).
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      # Push naar develop -> ik deploy naar mijn test-omgeving (devpreseed.roethof.net)
+      - develop
+      # Push naar master -> ik deploy naar productie (preseed.roethof.net)
+      - master
+
+  # Zo kan ik de workflow ook handmatig starten vanuit de Actions-tab,
+  # bijvoorbeeld als ik opnieuw wil deployen zonder een nieuwe commit te pushen.
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    # Naam die ik in de Actions-run te zien krijg; laat meteen zien welke
+    # omgeving het betreft.
+    name: 🚀 Deploy (${{ github.ref_name == 'master' && 'production' || 'development' }})
+    runs-on: ubuntu-latest
+
+    # Ik koppel dit dynamisch aan een GitHub Environment: 'production' bij
+    # push naar master, anders 'development' (dus bij develop). Per
+    # environment heb ik in Settings → Environments losse variables/secrets
+    # staan (DEPLOY_HOST, DEPLOY_USER, DEPLOY_WEBSITE, SSH_PRIVATE_KEY),
+    # zodat ik dev en prod nooit door elkaar kan gooien. Hier kan ik ook nog een
+    # approval-vereiste aan hangen, zodat een deploy naar production pas
+    # start nadat ik het zelf heb goedgekeurd.
+    environment: ${{ github.ref_name == 'master' && 'production' || 'development' }}
+
+    steps:
+      # Ik haal de repo-inhoud van de huidige branch op naar de runner.
+      - name: 🧾 Checkout repository
+        uses: actions/checkout@v4
+
+      # Ik zet mijn SSH private key (uit de environment-secrets) klaar in de
+      # ssh-agent van de runner, zodat ik verderop zonder wachtwoord kan
+      # inloggen op de server voor rsync en de ssh-action.
+      - name: 🔐 Install SSH Key
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # De runner is elke keer een verse, "kale" machine, dus known_hosts
+          # bestaat nog niet. Deze placeholder voorkomt dat de action faalt
+          # omdat het bestand ontbreekt; de echte host-key voeg ik in de
+          # volgende stap toe.
+          known_hosts: 'just-a-placeholder-so-we-dont-get-errors'
+
+      # Ik voeg de host-key van mijn server toe aan known_hosts, zodat ssh/
+      # rsync me niet interactief vragen "are you sure you want to continue
+      # connecting?" — dat zou in een niet-interactieve CI-run vastlopen.
+      - name: 🧱 Add Known Hosts
+        run: ssh-keyscan -H ${{ vars.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      # Ik kopieer de repo-inhoud naar de doelmap op de server, als mezelf
+      # (dus geen root nodig, en de bestanden komen meteen met de juiste
+      # eigenaar aan te staan). Het pad bouw ik net als bij mijn Hugo-blog
+      # op als domains/<website>/public_html/ — DEPLOY_WEBSITE is per
+      # environment devpreseed.roethof.net of preseed.roethof.net, DEPLOY_HOST
+      # is de daadwerkelijke SSH-server (die kan afwijken van het domein).
+      # -a  : archive-mode, behoudt permissies/timestamps/symlinks
+      # -v  : verbose, zodat ik in de log zie wat er gesynct wordt
+      # -z  : comprimeert tijdens transport
+      # --delete : ruimt op de server bestanden op die niet meer in mijn
+      #            repo staan (anders blijven oude/verwijderde files hangen).
+      #            vendor/ en node_modules/ staan niet in mijn repo (staan
+      #            in .gitignore) en worden dus NIET geraakt door --delete —
+      #            die blijven gewoon staan totdat de build-stap hieronder
+      #            ze overschrijft.
+      - name: 🚚 Deploy with rsync
+        run: |
+          rsync -avz --delete \
+            --exclude='.git*' \
+            --exclude='.env' \
+            --exclude='storage/' \
+            ./ ${{ vars.DEPLOY_USER }}@${{ vars.DEPLOY_HOST }}:domains/${{ vars.DEPLOY_WEBSITE }}/public_html/
+
+      # Ik log via SSH in op de server (als mezelf) en laat daar de
+      # daadwerkelijke build en housekeeping draaien — dus met de PHP/Node-
+      # versies en extensies die ík op de server heb staan, niet die van de
+      # runner.
+      - name: 🏗️ Build op de server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ vars.DEPLOY_HOST }}
+          username: ${{ vars.DEPLOY_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd domains/${{ vars.DEPLOY_WEBSITE }}/public_html
+
+            # PHP-dependencies installeren; --no-dev laat ik dev-only
+            # packages (testtools e.d.) achterwege — sneller en een
+            # kleinere footprint.
+            composer install --no-dev --optimize-autoloader --no-interaction
+
+            # Node-dependencies installeren en mijn frontend-assets bouwen
+            # (Vite/Tailwind output naar public/build).
+            npm install
+            npm run build
+
+            # Database-migraties uitvoeren. --force heb ik nodig omdat
+            # artisan in productie normaal om bevestiging vraagt, en dat
+            # kan niet in een non-interactieve SSH-sessie.
+            php artisan migrate --force
+
+            # Ik cache config/routes/views voor betere performance.
+            # Let op voor mezelf: als ik hierna nog handmatig iets in .env
+            # aanpas op de server, moet ik php artisan config:clear draaien,
+            # anders blijft de app de oude gecachte config gebruiken.
+            php artisan config:cache
+            php artisan route:cache
+            php artisan view:cache
