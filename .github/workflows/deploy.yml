@@ -1,0 +1,110 @@
+# Deploy workflow voor mijn Laravel/Inertia/Vue preseed-generator.
+#
+# Ik laat hier NIETS bouwen op de GitHub Actions-runner, en ik rsync ook
+# niets meer: de server haalt de code zelf rechtstreeks van GitHub op via
+# git (clone bij de eerste keer, daarna fetch + reset --hard). Zo is de
+# DEPLOY_PATH altijd een echte git-checkout van de juiste branch, en hoeft
+# de runner geen bestanden naar de server te sturen.
+#
+# Ik log via SSH in als mezelf (de deploy-user), niet als root.
+
+name: 🚀 Deploy Laravel
+
+# Ik geef deze workflow alleen leesrechten op de repo; hij hoeft nergens
+# naar terug te schrijven (geen commits, geen PR's). Checkout op de runner
+# gebeurt niet eens meer, maar ik laat dit staan als minimale, veilige default.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      # Push naar develop -> deploy naar mijn test-omgeving (devpreseed.roethof.net)
+      - develop
+      # Push naar master -> deploy naar productie (preseed.roethof.net)
+      - master
+
+  # Zo kan ik de workflow ook handmatig starten vanuit de Actions-tab,
+  # bijvoorbeeld als ik opnieuw wil deployen zonder een nieuwe commit te pushen.
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    # Naam die ik in de Actions-run te zien krijg; laat meteen zien welke
+    # branch/omgeving het betreft.
+    name: 🚀 Deploy (${{ github.ref_name }})
+    runs-on: ubuntu-latest
+
+    # Ik gebruik de branchnaam rechtstreeks als GitHub Environment-naam
+    # (dus geen vertaling meer naar 'production'/'development' — dat gaf
+    # verwarring). Bij push naar master gebruikt de job de environment
+    # 'master', bij develop de environment 'develop'. Die environments
+    # moeten in Settings → Environments EXACT zo heten (hoofdletter-
+    # gevoelig), met daarin DEPLOY_HOST, DEPLOY_USER, DEPLOY_PATH en
+    # SSH_PRIVATE_KEY per omgeving.
+    environment: ${{ github.ref_name }}
+
+    steps:
+      # Ik zet mijn SSH private key (uit de environment-secrets) klaar in de
+      # ssh-agent van de runner.
+      - name: 🔐 Install SSH Key
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          known_hosts: 'just-a-placeholder-so-we-dont-get-errors'
+
+      # Ik voeg de host-key van mijn server toe aan known_hosts.
+      - name: 🧱 Add Known Hosts
+        run: ssh-keyscan -H ${{ vars.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      # Ik log via SSH in en laat de server zelf de code ophalen en bouwen.
+      #
+      # - Als DEPLOY_PATH nog geen git-repo is: clone de juiste branch erin.
+      #   Let op: git clone weigert in een NIET-lege map, dus de eerste keer
+      #   moet DEPLOY_PATH leeg zijn (of ik verwijder 'm en laat git 'm
+      #   opnieuw aanmaken).
+      # - Als DEPLOY_PATH al een git-repo is: fetch + reset --hard naar de
+      #   laatste commit op de remote branch. Dat is bewust geen 'git pull':
+      #   pull kan merge-conflicten geven als er ooit lokaal iets is
+      #   aangepast op de server; reset --hard gooit lokale wijzigingen weg
+      #   en garandeert dat de server exact gelijk loopt aan GitHub.
+      #   git clean -fd ruimt daarna ook niet-getrackte bestanden op die
+      #   niet in .gitignore staan (voorkomt rommel van oude deploys).
+      - name: 🏗️ Deploy en build op de server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ vars.DEPLOY_HOST }}
+          username: ${{ vars.DEPLOY_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd ${{ vars.DEPLOY_PATH }}
+
+            if [ -d .git ]; then
+              git fetch origin
+              git reset --hard origin/${{ github.ref_name }}
+              git clean -fd
+            else
+              git clone --branch ${{ github.ref_name }} --single-branch \
+                https://github.com/rroethof/preseed.roethof.eu.git .
+            fi
+
+            # PHP-dependencies installeren; --no-dev laat dev-only packages
+            # (testtools e.d.) achterwege.
+            composer install --no-dev --optimize-autoloader --no-interaction
+
+            # Node-dependencies installeren en de frontend-assets bouwen.
+            npm install
+            npm run build
+
+            # Database-migraties uitvoeren. --force is nodig omdat artisan
+            # anders om bevestiging vraagt, wat in een non-interactieve
+            # SSH-sessie niet kan.
+            php artisan migrate --force
+
+            # Config/routes/views cachen voor betere performance.
+            # Let op voor mezelf: na een handmatige .env-wijziging op de
+            # server moet ik php artisan config:clear draaien.
+            php artisan config:cache
+            php artisan route:cache
+            php artisan view:cache
