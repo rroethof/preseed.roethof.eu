@@ -89,6 +89,14 @@ jobs:
                 https://github.com/rroethof/preseed.roethof.eu.git .
             fi
 
+            # Oude gecachte config/services/packages weggooien vóórdat
+            # composer's postAutoloadDump-hook (package:discover) draait.
+            # Zonder dit liep ik tegen "Call to a member function make() on
+            # null" aan: een verouderde bootstrap/cache/*.php paste niet meer
+            # bij de net bijgewerkte dependencies, en package:discover
+            # crashte daarop tijdens het opbouwen van de container.
+            rm -f bootstrap/cache/*.php
+
             # PHP-dependencies installeren; --no-dev laat dev-only packages
             # (testtools e.d.) achterwege.
             composer install --no-dev --optimize-autoloader --no-interaction
